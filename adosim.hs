@@ -133,23 +133,31 @@ applicativeBindStmt stmts =
 --     - find a good place to insert a bind: si
 --       T(s1;...;si; do { si+1;..;sn;L })
 
-betterAdo :: [Stmt] -> Expr -> Expr
+betterAdo :: [Stmt] -> ([Stmt],Expr) -> ([Stmt],Expr)
 betterAdo [] last = last
-betterAdo [one] last = doE [one] last
-betterAdo stmts last =
+betterAdo [one] (stmts,last) = (one:stmts,last)
+betterAdo stmts last@(last_stmts,last_expr) =
   case segments stmts of
     [] -> error "betterAdo"
     [one] -> betterAdo before (betterAdo after last)
       where (before,after) = splitSegment one
-    more -> applicativeLastStmt (map trSeg more) last
+    more -> applicativeStmt (map trSeg more) last
       where
+        lastvars = Set.unions (exprVars last_expr :
+                      map (exprVars . stmtExpr) last_stmts)
         trSeg :: [Stmt] -> Stmt
         trSeg [one] = one
-        trSeg stmts = BindStmt pat (betterAdo stmts (App (Var "return") pat))
+        trSeg stmts = BindStmt pat $ uncurry doE $
+                         betterAdo stmts ([], App (Var "return") pat)
           where
             pvars = Set.unions (map patVars (map stmtPat stmts))
-                      `Set.intersection` exprVars last
+                      `Set.intersection` lastvars
             pat = tupleE (map Var (Set.toList pvars))
+
+
+applicativeStmt :: [Stmt] -> ([Stmt],Expr) -> ([Stmt],Expr)
+applicativeStmt stmts ([],last) = ([], applicativeLastStmt stmts last)
+applicativeStmt stmts (rest,last) = (applicativeBindStmt stmts : rest, last)
 
 segments :: [Stmt] -> [[Stmt]]
 segments stmts = reverse $ map reverse $ walk (reverse stmts)
@@ -220,7 +228,7 @@ t0 :: Expr -> Doc
 t0 = runtest (\stmts last -> uncurry doE $ simpleAdo (stmts,last))
 
 t1 :: Expr -> Doc
-t1 = runtest betterAdo
+t1 = runtest (\stmts last -> uncurry doE $ betterAdo stmts ([],last))
 
 (x1:x2:x3:x4:x5:x6:x7:_) = map Var (map (('x':) . show) [1..])
 [w,x,y,z] = map Var ["w","x","y","z"]
@@ -280,16 +288,23 @@ ex4 = Do
  , BindStmt w c
  ] (foldl App f [y,z,w])
 {-
-cannot do b in parallel with a, because g depends on a and we must
-maintain ordering.
 
 (a ; b | g) | c
+or
+((a | b); g) | c
 
 (\(y,z) -> \w -> f y z w)
   <$> (do
          x <- a
          (\y -> \z -> return (y,z)) <$> b <*> g x)
   <*> c
+
+join ((\(y,z) -> \w -> f y z w)
+        <$> (do
+               (x,y) <- (,,) <$> a <*> b
+               z <- g x
+               return (y,z))
+        <*> c)
 -}
 
 ex5 :: Expr
@@ -301,14 +316,13 @@ ex5 = Do
  , BindStmt x1 (App h z)
  ] (foldl App f [y,w,x1])
 {-
-a ; (b | (c ; g | h))
+(a | b | c) ; (g | h)
 
-do
-  x <- a
-  (\y -> \(w,x1) -> f y w x1) <$> b
-    <*> (do
-           z <- c
-           (\w -> \x1 -> return (w,x1)) <$> g x <*> h z)
+join ((\x -> \y -> \z -> join ((\w -> \x1 -> f y w x1) <$> g x
+                                 <*> h z))
+        <$> a
+        <*> b
+        <*> c)
 -}
 
 ex6 :: Expr
@@ -361,8 +375,8 @@ ex8 = Do
  , BindStmt x5 e
  ] (foldl App f [x3,x4,x5])
 {-
-a/e in parallel, c/d in parallel
-(a ; b ; (c | d)) | e
+a/b/e in parallel, c/d in parallel
+((a | b) ; (c | d)) | e
 
 (\(x3,x4) -> \x5 -> f x3 x4 x5)
   <$> ((\x1 -> \x2 -> (\x3 -> \x4 -> return (x3,x4)) <$> c x1
