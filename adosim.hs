@@ -14,11 +14,13 @@ data Expr
   | OpApp Expr Var Expr
   | Tuple [Expr]
   | Do [Stmt] Expr
+  | ADo MBlock Expr
   | Lam Pat Expr
   deriving Show
 
 data Stmt = BindStmt { stmtPat :: Pat, stmtExpr ::  Expr }
   deriving Show
+
 
 doE [] last = last
 doE stmts (Do stmts' last) = doE (stmts++stmts') last
@@ -59,6 +61,7 @@ pprExpr (OpApp l op r) =
   hang (pprExprL l) 2 (text op <+> pprExprR r)
 pprExpr (Do stmts e) =
   hang (text "do") 2 (vcat (map pprStmt stmts) $$ pprExpr e)
+pprExpr (ADo mblock tail) = pprExpr (dsBlock mblock tail)
 pprExpr (Lam pat e) = text "\\" <> pprExpr pat <+> text "->" <+> pprExpr e
 pprExpr other = pprExpr9 other
 
@@ -74,6 +77,76 @@ pprExpr9 :: Expr -> Doc
 pprExpr9 (Var v) = text v
 pprExpr9 (Tuple pats) = parens (hcat (punctuate comma (map pprExpr pats)))
 pprExpr9 e = parens (pprExpr e)
+
+-- -----------------------------------------------------------------------------
+
+{-
+  expr ::= ... | do block | ...
+
+  mtail ::= return expr
+          | expr
+
+  block ::= mblock ;; mtail
+
+  mblock ::= empty
+           | ablock ; mblock
+
+  ablock ::= (mblock_1{vs1} | ... | mblock_n{vsn})    -- n>=2
+         | pat <- expr
+-}
+
+data MBlock = MBlockEmpty | MBlock ABlock MBlock
+  deriving Show
+
+data ABlock = ABlock [(MBlock,[Var])] | AStmt Stmt
+  deriving Show
+
+{-
+(B1)   dsBlock[ empty ;; mtail ] = mtail
+
+(B2)   dsBlock[ (pat <- rhs ; empty) ;; return etail ]
+         = (\pat. etail) <$> rhs
+
+(B3)   dsBlock[ (mb1{vs1} | .. | mbn{vsn}) ; empty) ;; return etail ]
+         = (\vs1 .. vsn. etail) <$> dsBlock[mb1 ;; return vs1]
+                                <*> ...
+                                <*> dsblock[ mbn ;; return vsn ])
+
+(B4)   dsBlock[ (pat <- rhs ; mb) ;; tail ]
+          = rhs >>= \pat -> dsBlock[ mb ;; tail ]
+
+(B5)   dsBlock[ ((mb1{vs1} | .. | mbn{vsn}) ; mb) ;; tail ]
+          = join ((\vs1 .. vsn. dsBlock[ mb ;; tail ])
+                     <$> dsBlock[mb1 ;; return vs1]
+                     <*> ...
+                     <*> dsblock[ mbn ;; return vsn ])
+-}
+
+dsBlock :: MBlock -> Expr -> Expr
+dsBlock MBlockEmpty tail = tail
+dsBlock (MBlock (AStmt (BindStmt pat rhs)) MBlockEmpty) (App (Var "return") e)
+  = case (e,pat) of
+      (Var x, Var y) | x == y -> rhs
+      _other -> OpApp (Lam pat e) "<$>" rhs
+dsBlock (MBlock (ABlock pairs) MBlockEmpty) (App (Var "return") expr) =
+  foldl mk_app_call (foldr Lam expr pats) (zip ops exprs)
+  where
+   (exprs,pats) = unzip [ (dsBlock mblock (App (Var "return") tup), tup)
+                        | (mblock,vars) <- pairs
+                        , let tup = tupleE (map Var vars) ]
+   ops = "<$>" : repeat "<*>"
+   mk_app_call l (op,r) = OpApp l op r
+dsBlock (MBlock (AStmt (BindStmt pat rhs)) mb) tail =
+   doE [BindStmt pat rhs] (dsBlock mb tail)
+dsBlock (MBlock (ABlock pairs) mb) tail =
+  App (Var "join") (foldl mk_app_call fun (zip ops exprs))
+  where
+   fun = foldr Lam (dsBlock mb tail) pats
+   (exprs,pats) = unzip [ (dsBlock mblock (App (Var "return") tup), tup)
+                        | (mblock,vars) <- pairs
+                        , let tup = tupleE (map Var vars) ]
+   ops = "<$>" : repeat "<*>"
+   mk_app_call l (op,r) = OpApp l op r
 
 -- -----------------------------------------------------------------------------
 -- Simple ApplicativeDo
@@ -157,7 +230,9 @@ betterAdo stmts last@(last_stmts,last_expr) =
 
 applicativeStmt :: [Stmt] -> ([Stmt],Expr) -> ([Stmt],Expr)
 applicativeStmt stmts ([],last) = ([], applicativeLastStmt stmts last)
-applicativeStmt stmts (rest,last) = (applicativeBindStmt stmts : rest, last)
+applicativeStmt stmts (rest,last) =
+  ([], applicativeLastStmt stmts (doE rest last))
+  -- (applicativeBindStmt stmts : rest, last)
 
 segments :: [Stmt] -> [[Stmt]]
 segments stmts = reverse $ map reverse $ walk (reverse stmts)
@@ -216,6 +291,32 @@ splitSegment (s:ss) =
     Just r -> r
 
 -- -----------------------------------------------------------------------------
+
+spjAdo :: [Stmt] -> MBlock -> Set Var -> MBlock
+spjAdo [] last _ = last
+spjAdo [one] last _ = MBlock (AStmt one) last
+spjAdo stmts last last_vars =
+  case segments stmts of
+    [] -> error "spjAdo"
+    [one] -> spjAdo before sequel (Set.union last_vars (mblockVars sequel))
+      where (before,after) = splitSegment one
+            sequel = spjAdo after last last_vars
+    more -> MBlock (ABlock (map trSeg more)) last
+      where
+        trSeg :: [Stmt] -> (MBlock,[Var])
+        trSeg stmts = (spjAdo stmts MBlockEmpty pvars, Set.toList pvars)
+          where
+            pvars = Set.unions (map patVars (map stmtPat stmts))
+                      `Set.intersection` last_vars
+
+mblockVars :: MBlock -> Set Var
+mblockVars MBlockEmpty = Set.empty
+mblockVars (MBlock ab mb) = ablockVars ab `Set.union` mblockVars mb
+
+ablockVars (AStmt (BindStmt _ e)) = exprVars e
+ablockVars (ABlock pairs) = Set.unions (map (mblockVars . fst) pairs)
+
+-- -----------------------------------------------------------------------------
 -- Examples & test framework
 
 runtest :: ([Stmt] -> Expr -> Expr) -> Expr -> Doc
@@ -229,6 +330,9 @@ t0 = runtest (\stmts last -> uncurry doE $ simpleAdo (stmts,last))
 
 t1 :: Expr -> Doc
 t1 = runtest (\stmts last -> uncurry doE $ betterAdo stmts ([],last))
+
+t2 :: Expr -> Doc
+t2 = runtest (\stmts last -> ADo (spjAdo stmts MBlockEmpty (exprVars last)) last)
 
 (x1:x2:x3:x4:x5:x6:x7:_) = map Var (map (('x':) . show) [1..])
 [w,x,y,z] = map Var ["w","x","y","z"]
@@ -282,16 +386,16 @@ a | (b;g) | e
 
 ex4 :: Expr
 ex4 = Do
- [ BindStmt x a
- , BindStmt y b
- , BindStmt z (App g x)
- , BindStmt w c
- ] (foldl App f [y,z,w])
+ [ BindStmt x1 a
+ , BindStmt x2 b
+ , BindStmt x3 (App c x1)
+ , BindStmt x4 d
+ ] (foldl App f [x2,x3,x4])
 {-
 
-(a ; b | g) | c
+(a ; b | c) | d
 or
-((a | b); g) | c
+((a | b); c) | d
 
 (\(y,z) -> \w -> f y z w)
   <$> (do
