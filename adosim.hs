@@ -291,7 +291,7 @@ splitSegment (s:ss) =
 -- -----------------------------------------------------------------------------
 
 spjAdo :: [Stmt] -> [Stmt] -> Set Var -> [Stmt]
-spjAdo []    last_stmts last_vars = last
+spjAdo []    last_stmts last_vars = []
 spjAdo [one] last_stmts last_vars = one:last_stmts
 spjAdo stmts last_stmts last_vars =
   case segments stmts of
@@ -347,6 +347,12 @@ a | b
 
 (\x -> \y -> f x y) <$> a <*> b
 -}
+
+ex1a :: Expr
+ex1a = Do
+ [ BindStmt x a
+ , BindStmt y b
+ ] (App (Var "return") (foldl App f [x,y]))
 
 ex2 :: Expr
 ex2 = Do
